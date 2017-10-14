@@ -62,7 +62,9 @@ export class FillScenarios {
             fillableAmount, fillableAmount,
         );
         const shouldThrowOnInsufficientBalanceOrAllowance = false;
-        await this.zeroEx.exchange.fillOrderAsync(signedOrder, partialFillAmount, shouldThrowOnInsufficientBalanceOrAllowance, takerAddress);
+        await this.zeroEx.exchange.fillOrderAsync(
+            signedOrder, partialFillAmount, shouldThrowOnInsufficientBalanceOrAllowance, takerAddress,
+        );
         return signedOrder;
     }
     private async createAsymmetricFillableSignedOrderWithFeesAsync(
@@ -89,7 +91,7 @@ export class FillScenarios {
     }
     private async increaseBalanceAndAllowanceAsync(
         tokenAddress: string, address: string, amount: BigNumber.BigNumber): Promise<void> {
-        if (amount.isZero()) {
+        if (amount.isZero() || address === ZeroEx.NULL_ADDRESS) {
             return; // noop
         }
         await Promise.all([

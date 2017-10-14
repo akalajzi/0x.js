@@ -1,12 +1,11 @@
 import * as _ from 'lodash';
 import * as BigNumber from 'bignumber.js';
-import {SchemaValidator, schemas} from '0x-json-schemas';
+import {schemas} from '0x-json-schemas';
 import {Web3Wrapper} from '../web3_wrapper';
 import {assert} from '../utils/assert';
-import {utils} from '../utils/utils';
-import {eventUtils} from '../utils/event_utils';
 import {constants} from '../utils/constants';
 import {ContractWrapper} from './contract_wrapper';
+import {AbiDecoder} from '../utils/abi_decoder';
 import {artifacts} from '../artifacts';
 import {
     TokenContract,
@@ -14,9 +13,10 @@ import {
     TokenEvents,
     IndexedFilterValues,
     SubscriptionOpts,
-    CreateContractEvent,
-    ContractEventEmitter,
-    ContractEventObj,
+    MethodOpts,
+    LogWithDecodedArgs,
+    EventCallback,
+    TokenContractEventArgs,
 } from '../types';
 
 const ALLOWANCE_TO_ZERO_GAS_AMOUNT = 47155;
@@ -29,24 +29,30 @@ const ALLOWANCE_TO_ZERO_GAS_AMOUNT = 47155;
 export class TokenWrapper extends ContractWrapper {
     public UNLIMITED_ALLOWANCE_IN_BASE_UNITS = constants.UNLIMITED_ALLOWANCE_IN_BASE_UNITS;
     private _tokenContractsByAddress: {[address: string]: TokenContract};
-    private _tokenLogEventEmitters: ContractEventEmitter[];
-    constructor(web3Wrapper: Web3Wrapper) {
-        super(web3Wrapper);
+    private _activeSubscriptions: string[];
+    private _tokenTransferProxyContractAddressFetcher: () => Promise<string>;
+    constructor(web3Wrapper: Web3Wrapper, abiDecoder: AbiDecoder,
+                tokenTransferProxyContractAddressFetcher: () => Promise<string>) {
+        super(web3Wrapper, abiDecoder);
         this._tokenContractsByAddress = {};
-        this._tokenLogEventEmitters = [];
+        this._activeSubscriptions = [];
+        this._tokenTransferProxyContractAddressFetcher = tokenTransferProxyContractAddressFetcher;
     }
     /**
      * Retrieves an owner's ERC20 token balance.
      * @param   tokenAddress    The hex encoded contract Ethereum address where the ERC20 token is deployed.
      * @param   ownerAddress    The hex encoded user Ethereum address whose balance you would like to check.
+     * @param   methodOpts      Optional arguments this method accepts.
      * @return  The owner's ERC20 token balance in base units.
      */
-    public async getBalanceAsync(tokenAddress: string, ownerAddress: string): Promise<BigNumber.BigNumber> {
+    public async getBalanceAsync(tokenAddress: string, ownerAddress: string,
+                                 methodOpts?: MethodOpts): Promise<BigNumber.BigNumber> {
         assert.isETHAddressHex('ownerAddress', ownerAddress);
         assert.isETHAddressHex('tokenAddress', tokenAddress);
 
         const tokenContract = await this._getTokenContractAsync(tokenAddress);
-        let balance = await tokenContract.balanceOf.callAsync(ownerAddress);
+        const defaultBlock = _.isUndefined(methodOpts) ? undefined : methodOpts.defaultBlock;
+        let balance = await tokenContract.balanceOf.callAsync(ownerAddress, defaultBlock);
         // Wrap BigNumbers returned from web3 with our own (later) version of BigNumber
         balance = new BigNumber(balance);
         return balance;
@@ -104,14 +110,16 @@ export class TokenWrapper extends ContractWrapper {
      * @param   ownerAddress    The hex encoded user Ethereum address whose allowance to spenderAddress
      *                          you would like to retrieve.
      * @param   spenderAddress  The hex encoded user Ethereum address who can spend the allowance you are fetching.
+     * @param   methodOpts      Optional arguments this method accepts.
      */
     public async getAllowanceAsync(tokenAddress: string, ownerAddress: string,
-                                   spenderAddress: string): Promise<BigNumber.BigNumber> {
+                                   spenderAddress: string, methodOpts?: MethodOpts): Promise<BigNumber.BigNumber> {
         assert.isETHAddressHex('ownerAddress', ownerAddress);
         assert.isETHAddressHex('tokenAddress', tokenAddress);
 
         const tokenContract = await this._getTokenContractAsync(tokenAddress);
-        let allowanceInBaseUnits = await tokenContract.allowance.callAsync(ownerAddress, spenderAddress);
+        const defaultBlock = _.isUndefined(methodOpts) ? undefined : methodOpts.defaultBlock;
+        let allowanceInBaseUnits = await tokenContract.allowance.callAsync(ownerAddress, spenderAddress, defaultBlock);
         // Wrap BigNumbers returned from web3 with our own (later) version of BigNumber
         allowanceInBaseUnits = new BigNumber(allowanceInBaseUnits);
         return allowanceInBaseUnits;
@@ -120,13 +128,15 @@ export class TokenWrapper extends ContractWrapper {
      * Retrieves the owner's allowance in baseUnits set to the 0x proxy contract.
      * @param   tokenAddress    The hex encoded contract Ethereum address where the ERC20 token is deployed.
      * @param   ownerAddress    The hex encoded user Ethereum address whose proxy contract allowance we are retrieving.
+     * @param   methodOpts      Optional arguments this method accepts.
      */
-    public async getProxyAllowanceAsync(tokenAddress: string, ownerAddress: string): Promise<BigNumber.BigNumber> {
+    public async getProxyAllowanceAsync(tokenAddress: string, ownerAddress: string,
+                                        methodOpts?: MethodOpts): Promise<BigNumber.BigNumber> {
         assert.isETHAddressHex('ownerAddress', ownerAddress);
         assert.isETHAddressHex('tokenAddress', tokenAddress);
 
-        const proxyAddress = await this._getProxyAddressAsync();
-        const allowanceInBaseUnits = await this.getAllowanceAsync(tokenAddress, ownerAddress, proxyAddress);
+        const proxyAddress = await this._getTokenTransferProxyAddressAsync();
+        const allowanceInBaseUnits = await this.getAllowanceAsync(tokenAddress, ownerAddress, proxyAddress, methodOpts);
         return allowanceInBaseUnits;
     }
     /**
@@ -144,7 +154,7 @@ export class TokenWrapper extends ContractWrapper {
         assert.isETHAddressHex('tokenAddress', tokenAddress);
         assert.isBigNumber('amountInBaseUnits', amountInBaseUnits);
 
-        const proxyAddress = await this._getProxyAddressAsync();
+        const proxyAddress = await this._getTokenTransferProxyAddressAsync();
         const txHash = await this.setAllowanceAsync(tokenAddress, ownerAddress, proxyAddress, amountInBaseUnits);
         return txHash;
     }
@@ -237,46 +247,62 @@ export class TokenWrapper extends ContractWrapper {
      * Subscribe to an event type emitted by the Token contract.
      * @param   tokenAddress        The hex encoded address where the ERC20 token is deployed.
      * @param   eventName           The token contract event you would like to subscribe to.
-     * @param   subscriptionOpts    Subscriptions options that let you configure the subscription.
      * @param   indexFilterValues   An object where the keys are indexed args returned by the event and
      *                              the value is the value you are interested in. E.g `{maker: aUserAddressHex}`
-     * @return ContractEventEmitter object
+     * @param   callback            Callback that gets called when a log is added/removed
+     * @return Subscription token used later to unsubscribe
      */
-    public async subscribeAsync(tokenAddress: string, eventName: TokenEvents, subscriptionOpts: SubscriptionOpts,
-                                indexFilterValues: IndexedFilterValues): Promise<ContractEventEmitter> {
+    public subscribe<ArgsType extends TokenContractEventArgs>(
+        tokenAddress: string, eventName: TokenEvents, indexFilterValues: IndexedFilterValues,
+        callback: EventCallback<ArgsType>): string {
+        assert.isETHAddressHex('tokenAddress', tokenAddress);
+        assert.doesBelongToStringEnum('eventName', eventName, TokenEvents);
+        assert.doesConformToSchema('indexFilterValues', indexFilterValues, schemas.indexFilterValuesSchema);
+        assert.isFunction('callback', callback);
+        const subscriptionToken = this._subscribe<ArgsType>(
+            tokenAddress, eventName, indexFilterValues, artifacts.TokenArtifact.abi, callback,
+        );
+        this._activeSubscriptions.push(subscriptionToken);
+        return subscriptionToken;
+    }
+    /**
+     * Cancel a subscription
+     * @param   subscriptionToken Subscription token returned by `subscribe()`
+     */
+    public unsubscribe(subscriptionToken: string): void {
+        _.pull(this._activeSubscriptions, subscriptionToken);
+        this._unsubscribe(subscriptionToken);
+    }
+    /**
+     * Gets historical logs without creating a subscription
+     * @param   tokenAddress        An address of the token that emmited the logs.
+     * @param   eventName           The token contract event you would like to subscribe to.
+     * @param   subscriptionOpts    Subscriptions options that let you configure the subscription.
+     * @param   indexFilterValues   An object where the keys are indexed args returned by the event and
+     *                              the value is the value you are interested in. E.g `{_from: aUserAddressHex}`
+     * @return  Array of logs that match the parameters
+     */
+    public async getLogsAsync<ArgsType extends TokenContractEventArgs>(
+        tokenAddress: string, eventName: TokenEvents, subscriptionOpts: SubscriptionOpts,
+        indexFilterValues: IndexedFilterValues): Promise<Array<LogWithDecodedArgs<ArgsType>>> {
         assert.isETHAddressHex('tokenAddress', tokenAddress);
         assert.doesBelongToStringEnum('eventName', eventName, TokenEvents);
         assert.doesConformToSchema('subscriptionOpts', subscriptionOpts, schemas.subscriptionOptsSchema);
         assert.doesConformToSchema('indexFilterValues', indexFilterValues, schemas.indexFilterValuesSchema);
-        const tokenContract = await this._getTokenContractAsync(tokenAddress);
-        let createLogEvent: CreateContractEvent;
-        switch (eventName) {
-            case TokenEvents.Approval:
-                createLogEvent = tokenContract.Approval;
-                break;
-            case TokenEvents.Transfer:
-                createLogEvent = tokenContract.Transfer;
-                break;
-            default:
-                throw utils.spawnSwitchErr('TokenEvents', eventName);
-        }
-
-        const logEventObj: ContractEventObj = createLogEvent(indexFilterValues, subscriptionOpts);
-        const eventEmitter = eventUtils.wrapEventEmitter(logEventObj);
-        this._tokenLogEventEmitters.push(eventEmitter);
-        return eventEmitter;
+        const logs = await this._getLogsAsync<ArgsType>(
+            tokenAddress, eventName, subscriptionOpts, indexFilterValues, artifacts.TokenArtifact.abi,
+        );
+        return logs;
     }
     /**
-     * Stops watching for all token events
+     * Cancels all existing subscriptions
      */
-    public async stopWatchingAllEventsAsync(): Promise<void> {
-        const stopWatchingPromises = _.map(this._tokenLogEventEmitters,
-                                           logEventObj => logEventObj.stopWatchingAsync());
-        await Promise.all(stopWatchingPromises);
-        this._tokenLogEventEmitters = [];
+    public unsubscribeAll(): void {
+        _.forEach(this._activeSubscriptions, this._unsubscribe.bind(this));
+        this._activeSubscriptions = [];
     }
-    private async _invalidateContractInstancesAsync(): Promise<void> {
-        await this.stopWatchingAllEventsAsync();
+    private _invalidateContractInstancesAsync(): void {
+        this.unsubscribeAll();
         this._tokenContractsByAddress = {};
     }
     private async _getTokenContractAsync(tokenAddress: string): Promise<TokenContract> {
@@ -291,15 +317,8 @@ export class TokenWrapper extends ContractWrapper {
         this._tokenContractsByAddress[tokenAddress] = tokenContract;
         return tokenContract;
     }
-    private async _getProxyAddressAsync() {
-        const networkIdIfExists = await this._web3Wrapper.getNetworkIdIfExistsAsync();
-        const proxyNetworkConfigsIfExists = _.isUndefined(networkIdIfExists) ?
-                                       undefined :
-                                       artifacts.TokenTransferProxyArtifact.networks[networkIdIfExists];
-        if (_.isUndefined(proxyNetworkConfigsIfExists)) {
-            throw new Error(ZeroExError.ContractNotDeployedOnNetwork);
-        }
-        const proxyAddress = proxyNetworkConfigsIfExists.address.toLowerCase();
-        return proxyAddress;
+    private async _getTokenTransferProxyAddressAsync(): Promise<string> {
+        const tokenTransferProxyContractAddress = await this._tokenTransferProxyContractAddressFetcher();
+        return tokenTransferProxyContractAddress;
     }
 }

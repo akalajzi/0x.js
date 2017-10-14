@@ -2,17 +2,19 @@ import * as _ from 'lodash';
 import * as Web3 from 'web3';
 import * as BigNumber from 'bignumber.js';
 import promisify = require('es6-promisify');
-import {ZeroExError} from './types';
+import {ZeroExError, Artifact} from './types';
 import {Contract} from './contract';
 
 export class Web3Wrapper {
     private web3: Web3;
     private defaults: Partial<Web3.TxData>;
     private networkIdIfExists?: number;
+    private jsonRpcRequestId: number;
     constructor(provider: Web3.Provider, defaults: Partial<Web3.TxData>) {
         this.web3 = new Web3();
         this.web3.setProvider(provider);
         this.defaults = defaults;
+        this.jsonRpcRequestId = 0;
     }
     public setProvider(provider: Web3.Provider) {
         delete this.networkIdIfExists;
@@ -92,13 +94,40 @@ export class Web3Wrapper {
         const signData = await promisify(this.web3.eth.sign)(address, message);
         return signData;
     }
-    public async getBlockTimestampAsync(blockHash: string): Promise<number> {
-        const {timestamp} = await promisify(this.web3.eth.getBlock)(blockHash);
+    public async getBlockAsync(blockParam: string|Web3.BlockParam): Promise<Web3.BlockWithoutTransactionData> {
+        const block = await promisify(this.web3.eth.getBlock)(blockParam);
+        return block;
+    }
+    public async getBlockTimestampAsync(blockParam: string|Web3.BlockParam): Promise<number> {
+        const {timestamp} = await this.getBlockAsync(blockParam);
         return timestamp;
     }
     public async getAvailableAddressesAsync(): Promise<string[]> {
         const addresses: string[] = await promisify(this.web3.eth.getAccounts)();
         return addresses;
+    }
+    public async getLogsAsync(filter: Web3.FilterObject): Promise<Web3.LogEntry[]> {
+        let fromBlock = filter.fromBlock;
+        if (_.isNumber(fromBlock)) {
+            fromBlock = this.web3.toHex(fromBlock);
+        }
+        let toBlock = filter.toBlock;
+        if (_.isNumber(toBlock)) {
+            toBlock = this.web3.toHex(toBlock);
+        }
+        const serializedFilter = {
+            ...filter,
+            fromBlock,
+            toBlock,
+        };
+        const payload = {
+            jsonrpc: '2.0',
+            id: this.jsonRpcRequestId++,
+            method: 'eth_getLogs',
+            params: [serializedFilter],
+        };
+        const logs = await this.sendRawPayloadAsync(payload);
+        return logs;
     }
     private getContractInstance<A extends Web3.ContractInstance>(abi: Web3.ContractAbi, address: string): A {
         const web3ContractInstance = this.web3.eth.contract(abi).at(address);
@@ -108,5 +137,11 @@ export class Web3Wrapper {
     private async getNetworkAsync(): Promise<number> {
         const networkId = await promisify(this.web3.version.getNetwork)();
         return networkId;
+    }
+    private async sendRawPayloadAsync(payload: Web3.JSONRPCRequestPayload): Promise<any> {
+        const sendAsync = this.web3.currentProvider.sendAsync.bind(this.web3.currentProvider);
+        const response = await promisify(sendAsync)(payload);
+        const result = response.result;
+        return result;
     }
 }

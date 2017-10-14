@@ -1,12 +1,8 @@
 import * as _ from 'lodash';
 import * as BigNumber from 'bignumber.js';
-import * as Web3 from 'web3';
-import * as abiDecoder from 'abi-decoder';
 import {SchemaValidator, schemas} from '0x-json-schemas';
 import {bigNumberConfigs} from './bignumber_config';
 import * as ethUtil from 'ethereumjs-util';
-import findVersions = require('find-versions');
-import compareVersions = require('compare-versions');
 import {Web3Wrapper} from './web3_wrapper';
 import {constants} from './utils/constants';
 import {utils} from './utils/utils';
@@ -27,11 +23,9 @@ import {
     SignedOrder,
     Web3Provider,
     ZeroExConfig,
-    TransactionReceipt,
-    DecodedLogArgs,
     TransactionReceiptWithDecodedLogs,
-    LogWithDecodedArgs,
 } from './types';
+import {zeroExConfigSchema} from './schemas/zero_ex_config_schema';
 
 // Customize our BigNumber instances
 bigNumberConfigs.configure();
@@ -180,6 +174,9 @@ export class ZeroEx {
      */
     constructor(provider: Web3Provider, config?: ZeroExConfig) {
         assert.isWeb3Provider('provider', provider);
+        if (!_.isUndefined(config)) {
+            assert.doesConformToSchema('config', config, zeroExConfigSchema);
+        }
         if (_.isUndefined((provider as any).sendAsync)) {
             // Web3@1.0 provider doesn't support synchronous http requests,
             // so it only has an async `send` method, instead of a `send` and `sendAsync` in web3@0.x.x`
@@ -194,11 +191,28 @@ export class ZeroEx {
             gasPrice,
         };
         this._web3Wrapper = new Web3Wrapper(provider, defaults);
-        this.token = new TokenWrapper(this._web3Wrapper);
-        this.proxy = new TokenTransferProxyWrapper(this._web3Wrapper);
-        this.exchange = new ExchangeWrapper(this._web3Wrapper, this.token);
-        this.tokenRegistry = new TokenRegistryWrapper(this._web3Wrapper);
-        this.etherToken = new EtherTokenWrapper(this._web3Wrapper, this.token);
+        this.token = new TokenWrapper(
+            this._web3Wrapper,
+            this._abiDecoder,
+            this._getTokenTransferProxyAddressAsync.bind(this),
+        );
+        const exchageContractAddressIfExists = _.isUndefined(config) ? undefined : config.exchangeContractAddress;
+        this.exchange = new ExchangeWrapper(
+            this._web3Wrapper,
+            this._abiDecoder,
+            this.token,
+            exchageContractAddressIfExists,
+        );
+        this.proxy = new TokenTransferProxyWrapper(
+            this._web3Wrapper,
+            this._getTokenTransferProxyAddressAsync.bind(this),
+        );
+        const tokenRegistryContractAddressIfExists = _.isUndefined(config) ?
+                                                     undefined :
+                                                     config.tokenRegistryContractAddress;
+        this.tokenRegistry = new TokenRegistryWrapper(this._web3Wrapper, tokenRegistryContractAddressIfExists);
+        const etherTokenContractAddressIfExists = _.isUndefined(config) ? undefined : config.etherTokenContractAddress;
+        this.etherToken = new EtherTokenWrapper(this._web3Wrapper, this.token, etherTokenContractAddressIfExists);
     }
     /**
      * Sets a new web3 provider for 0x.js. Updating the provider will stop all
@@ -285,17 +299,10 @@ export class ZeroEx {
                 const transactionReceipt = await this._web3Wrapper.getTransactionReceiptAsync(txHash);
                 if (!_.isNull(transactionReceipt)) {
                     intervalUtils.clearAsyncExcludingInterval(intervalId);
-                    const logsWithDecodedArgs = _.map(transactionReceipt.logs, (log: Web3.LogEntry) => {
-                        const decodedLog = this._abiDecoder.decodeLog(log);
-                        if (_.isUndefined(decodedLog)) {
-                            return log;
-                        }
-                        const logWithDecodedArgs: LogWithDecodedArgs = {
-                            ...log,
-                            ...decodedLog,
-                        };
-                        return logWithDecodedArgs;
-                    });
+                    const logsWithDecodedArgs = _.map(
+                        transactionReceipt.logs,
+                        this._abiDecoder.tryToDecodeLogOrNoop.bind(this._abiDecoder),
+                    );
                     const transactionReceiptWithDecodedLogArgs: TransactionReceiptWithDecodedLogs = {
                         ...transactionReceipt,
                         logs: logsWithDecodedArgs,
@@ -305,5 +312,15 @@ export class ZeroEx {
             }, pollingIntervalMs);
         });
         return txReceiptPromise;
+    }
+    /*
+     * HACK: `TokenWrapper` needs a token transfer proxy address. `TokenTransferProxy` address is fetched from
+     * an `ExchangeWrapper`. `ExchangeWrapper` needs `TokenWrapper` to validate orders, creating a dependency cycle.
+     * In order to break this - we create this function here and pass it as a parameter to the `TokenWrapper`
+     * and `ProxyWrapper`.
+     */
+    private async _getTokenTransferProxyAddressAsync(): Promise<string> {
+        const tokenTransferProxyAddress = await (this.exchange as any)._getTokenTransferProxyAddressAsync();
+        return tokenTransferProxyAddress;
     }
 }
